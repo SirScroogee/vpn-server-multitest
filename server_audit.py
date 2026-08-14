@@ -39,9 +39,11 @@ import urllib.request
 from typing import Any
 
 
-VERSION = "1.15.0"
+VERSION = "1.16.0"
 DEFAULT_TARGETS = ["1.1.1.1", "dns.google"]
 DEFAULT_REPORT_DIR = "server-audit-reports"
+IPERF_TCP_STREAM_PROFILES = (1, 4)
+DEFAULT_MTR_COUNT = 30
 RU_IPERF_CATALOG_URL = (
     "https://raw.githubusercontent.com/itdoginfo/russian-iperf3-servers/main/list.yml"
 )
@@ -230,6 +232,8 @@ class AuditConfig:
     iperf_endpoints: list[IperfEndpoint] = dataclasses.field(default_factory=list)
     iperf_catalog_mode: str | None = None
     iperf_seconds: int = 10
+    # Used only by the optional long-running custom-server load test. The
+    # regular TCP iperf3 test always runs both 1-stream and 4-stream profiles.
     iperf_streams: int = 4
     udp_mbps: int = 50
     # 0 enables the default automatic speed assessment. A positive value is a
@@ -1364,15 +1368,19 @@ def run_iperf_endpoint(
     endpoint: IperfEndpoint,
     port: int,
     seconds: int,
-    streams: int,
     *,
+    stream_profiles: tuple[int, ...] = IPERF_TCP_STREAM_PROFILES,
     include_udp: bool = False,
     udp_mbps: int = 50,
 ) -> list[TestResult]:
-    results = [
-        run_iperf(runner, endpoint.host, port, seconds, streams),
-        run_iperf(runner, endpoint.host, port, seconds, streams, reverse=True),
-    ]
+    results: list[TestResult] = []
+    for streams in stream_profiles:
+        results.extend(
+            [
+                run_iperf(runner, endpoint.host, port, seconds, streams),
+                run_iperf(runner, endpoint.host, port, seconds, streams, reverse=True),
+            ]
+        )
     for result in results:
         result.metrics["endpoint"] = endpoint.as_dict()
         result.metrics["selected_port"] = port
@@ -2690,9 +2698,29 @@ def _effective_throughput_score(mbps: float, expected_mbps: int | None) -> float
     return _automatic_throughput_score(mbps)
 
 
+def _preferred_iperf_profile(
+    measurements: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Use the 4-stream profile for capacity/scoring when both profiles exist."""
+    four_stream = [item for item in measurements if item.get("streams") == 4]
+    return four_stream or measurements
+
+
+def _iperf_measurements_are_public(measurements: list[dict[str, Any]]) -> bool:
+    selected = _preferred_iperf_profile(measurements)
+    return bool(selected) and all(
+        isinstance(item.get("endpoint"), dict) and item["endpoint"].get("public")
+        for item in selected
+    )
+
+
 def _representative_iperf_speed(measurements: list[dict[str, Any]]) -> float | None:
     """Return the weaker direction, using public-server medians when possible."""
-    comparable = [item for item in measurements if isinstance(item.get("mbps"), (int, float))]
+    comparable = [
+        item
+        for item in _preferred_iperf_profile(measurements)
+        if isinstance(item.get("mbps"), (int, float))
+    ]
     if not comparable:
         return None
     public = [
@@ -2779,7 +2807,7 @@ def _representative_iperf_retransmits_per_gib(
 ) -> float | None:
     comparable = [
         item
-        for item in measurements
+        for item in _preferred_iperf_profile(measurements)
         if isinstance(item.get("retransmits_per_gib"), (int, float))
     ]
     if not comparable:
@@ -2838,7 +2866,12 @@ def calculate_score(
         dimensions["latency"] = _piecewise_lower_better(
             worst_avg, [(20, 100), (40, 90), (70, 75), (110, 55), (160, 30), (250, 10), (math.inf, 0)]
         )
-    stability_samples = [*pings, *udp_results]
+    stability_pings = [
+        item
+        for item in pings
+        if "transmitted" not in item or int(item.get("transmitted", 0)) >= 5
+    ]
+    stability_samples = [*stability_pings, *udp_results]
     if stability_samples:
         worst_loss = max(float(item.get("loss_percent", 0)) for item in stability_samples)
         worst_jitter = max(float(item.get("jitter_ms", 0)) for item in stability_samples)
@@ -2862,7 +2895,12 @@ def calculate_score(
             dimensions["throughput"] = round(speed_score, 1)
         else:
             retransmission_score = _iperf_retransmission_score(representative_retransmits)
-            dimensions["throughput"] = round(speed_score * 0.7 + retransmission_score * 0.3, 1)
+            retransmission_weight = 0.1 if _iperf_measurements_are_public(iperfs) else 0.3
+            dimensions["throughput"] = round(
+                speed_score * (1 - retransmission_weight)
+                + retransmission_score * retransmission_weight,
+                1,
+            )
     system_parts: list[float] = []
     if vmstats:
         steal = max(float(item["steal_avg_percent"]) for item in vmstats)
@@ -2932,9 +2970,18 @@ def calculate_score(
         verdict = "плохой кандидат"
 
     warnings: list[str] = []
+    has_four_stream_iperf = any(
+        result.category == "iperf" and result.metrics.get("streams") == 4
+        for result in results
+    )
     for result in results:
         if result.category in {"ping", "soak"} and float(result.metrics.get("loss_percent", 0)) > 0:
             warnings.append(f"{result.name}: обнаружены потери пакетов")
+        if result.category == "ping" and int(result.metrics.get("transmitted", 0)) == 1:
+            warnings.append(
+                f"{result.name}: один запрос показывает задержку только в этот момент; "
+                "для оценки стабильности используйте 200"
+            )
         if float(result.metrics.get("steal_avg_percent", 0)) >= 2:
             warnings.append("CPU steal ≥ 2%: VPS может быть перепродан или соседние VM создают помехи")
         if result.category in {"ipinfo", "access", "dpi", "dnscheck"} and result.status in {"warning", "bad"}:
@@ -2945,6 +2992,12 @@ def calculate_score(
         if result.category in {"iperf", "soak_iperf"} and isinstance(
             normalized_retransmits, (int, float)
         ):
+            if (
+                result.category == "iperf"
+                and has_four_stream_iperf
+                and result.metrics.get("streams") != 4
+            ):
+                continue
             retransmission_status = _iperf_retransmission_status(float(normalized_retransmits))
             if retransmission_status in {"ВНИМАНИЕ", "ПЛОХО"}:
                 endpoint = result.metrics.get("endpoint")
@@ -2957,13 +3010,22 @@ def calculate_score(
                     if isinstance(endpoint, dict)
                     else result.name
                 )
-                warnings.append(
-                    f"{endpoint_name}: TCP-повторы {float(normalized_retransmits):g}/ГиБ — "
-                    + (
-                        "слишком много; возможны потери, перегрузка или нестабильный маршрут"
-                        if retransmission_status == "ПЛОХО"
-                        else "выше спокойного уровня; повторите измерение"
+                is_public = isinstance(endpoint, dict) and endpoint.get("public")
+                if is_public:
+                    reason = (
+                        "публичная точка могла быть перегружена; это слабый сигнал, "
+                        "повторите тест позже"
                     )
+                elif retransmission_status == "ПЛОХО":
+                    reason = (
+                        "слишком много; возможны потери, перегрузка или "
+                        "нестабильный маршрут"
+                    )
+                else:
+                    reason = "выше спокойного уровня; повторите измерение"
+                warnings.append(
+                    f"{endpoint_name}: TCP-повторы "
+                    f"{float(normalized_retransmits):g}/ГиБ — {reason}"
                 )
     if not measured["iperf_bidirectional"] and (
         requested_tests is None or bool(requested_tests & {"iperf", "udp"})
@@ -2998,9 +3060,9 @@ def estimate_audit_units(config: AuditConfig) -> float:
     if "dnscheck" in config.tests:
         units += 12
     per_target = {
-        "ping": max(4.0, config.ping_count * (0.25 if os.name != "nt" else 0.8)),
+        "ping": max(4.0, config.ping_count * (0.25 if os.name != "nt" else 1.0)),
         "tcp": 16.0,
-        "mtr": max(10.0, config.ping_count * 0.5),
+        "mtr": max(10.0, DEFAULT_MTR_COUNT * 0.5),
         "traceroute": 12.0,
         "pmtu": 8.0,
     }
@@ -3017,7 +3079,13 @@ def estimate_audit_units(config: AuditConfig) -> float:
             else 1,
         )
         tcp_units = endpoint_count * (
-            7 + (2 if "iperf" in config.tests else 0) * (config.iperf_seconds + 2)
+            7
+            + (
+                2 * len(IPERF_TCP_STREAM_PROFILES)
+                if "iperf" in config.tests
+                else 0
+            )
+            * (config.iperf_seconds + 2)
         )
         udp_units = (
             2 * (config.iperf_seconds + 2)
@@ -3049,7 +3117,7 @@ def run_audit(config: AuditConfig, *, verbose: bool = True) -> dict[str, Any]:
         if config.expected_mbps > 0:
             print(f"Ваш ручной ориентир скорости: {config.expected_mbps} Мбит/с")
         else:
-            print("Оценка скорости: автоматическая — по фактическому каналу и TCP-повторам")
+            print("Оценка скорости: автоматическая; профили 1 и 4 TCP-потока")
     if "system" in config.tests:
         results.extend(
             progress.run("Система, CPU и сетевой стек", 24, lambda: system_inventory(runner, benchmark=True))
@@ -3068,7 +3136,7 @@ def run_audit(config: AuditConfig, *, verbose: bool = True) -> dict[str, Any]:
         results.append(progress.run("DNS и защищённый DNS", 12, run_dns_checks))
     for target in config.targets:
         if "ping" in config.tests:
-            units = max(4.0, config.ping_count * (0.25 if os.name != "nt" else 0.8))
+            units = max(4.0, config.ping_count * (0.25 if os.name != "nt" else 1.0))
             results.append(
                 progress.run(
                     f"Ping → {target}", units, lambda target=target: run_ping(runner, target, config.ping_count)
@@ -3088,8 +3156,8 @@ def run_audit(config: AuditConfig, *, verbose: bool = True) -> dict[str, Any]:
             results.append(
                 progress.run(
                     f"MTR → {target}",
-                    max(10.0, config.ping_count * 0.5),
-                    lambda target=target: run_mtr(runner, target, config.ping_count),
+                    max(10.0, DEFAULT_MTR_COUNT * 0.5),
+                    lambda target=target: run_mtr(runner, target, DEFAULT_MTR_COUNT),
                 )
             )
         if "traceroute" in config.tests:
@@ -3129,7 +3197,13 @@ def run_audit(config: AuditConfig, *, verbose: bool = True) -> dict[str, Any]:
             else 1,
         )
         tcp_units = endpoint_count * (
-            7 + (2 if "iperf" in config.tests else 0) * (config.iperf_seconds + 2)
+            7
+            + (
+                2 * len(IPERF_TCP_STREAM_PROFILES)
+                if "iperf" in config.tests
+                else 0
+            )
+            * (config.iperf_seconds + 2)
         )
         udp_units = (
             2 * (config.iperf_seconds + 2)
@@ -3137,7 +3211,7 @@ def run_audit(config: AuditConfig, *, verbose: bool = True) -> dict[str, Any]:
             else 0
         )
         progress.begin(
-            "iperf3: поиск точки, upload и download",
+            "iperf3: 1 и 4 TCP-потока, upload и download",
             tcp_units + udp_units,
         )
     if "iperf" in config.tests:
@@ -3164,7 +3238,6 @@ def run_audit(config: AuditConfig, *, verbose: bool = True) -> dict[str, Any]:
                         endpoint,
                         port,
                         config.iperf_seconds,
-                        config.iperf_streams,
                     )
                 )
             for city in unavailable_cities:
@@ -3192,7 +3265,6 @@ def run_audit(config: AuditConfig, *, verbose: bool = True) -> dict[str, Any]:
                     endpoint,
                     config.iperf_port,
                     config.iperf_seconds,
-                    config.iperf_streams,
                     include_udp="udp" in config.tests,
                     udp_mbps=config.udp_mbps,
                 )
@@ -3231,7 +3303,7 @@ def run_audit(config: AuditConfig, *, verbose: bool = True) -> dict[str, Any]:
                 endpoint,
                 config.iperf_port,
                 config.iperf_seconds,
-                config.iperf_streams,
+                stream_profiles=(),
                 include_udp=True,
                 udp_mbps=config.udp_mbps,
             )
@@ -3252,7 +3324,7 @@ def run_audit(config: AuditConfig, *, verbose: bool = True) -> dict[str, Any]:
                     endpoint,
                     config.iperf_port,
                     config.iperf_seconds,
-                    config.iperf_streams,
+                    stream_profiles=(),
                     include_udp=True,
                     udp_mbps=config.udp_mbps,
                 )
@@ -3318,6 +3390,7 @@ def run_audit(config: AuditConfig, *, verbose: bool = True) -> dict[str, Any]:
             "iperf_catalog_mode": config.iperf_catalog_mode,
             "iperf_seconds": config.iperf_seconds,
             "iperf_streams": config.iperf_streams,
+            "iperf_stream_profiles": list(IPERF_TCP_STREAM_PROFILES),
             "udp_mbps": config.udp_mbps,
             "expected_mbps": config.expected_mbps,
             "check_ip": config.check_ip,
@@ -4066,9 +4139,14 @@ def _group_iperf_directions(results: list[dict[str, Any]]) -> list[dict[str, Any
                 metrics.get("selected_port"),
                 endpoint.get("city"),
                 endpoint.get("name"),
+                metrics.get("streams"),
             )
         else:
-            key = (_endpoint_name(result), metrics.get("selected_port"))
+            key = (
+                _endpoint_name(result),
+                metrics.get("selected_port"),
+                metrics.get("streams"),
+            )
         group = groups.setdefault(
             key,
             {"name": _endpoint_name(result), "upload": None, "download": None},
@@ -4124,9 +4202,13 @@ def _iperf_endpoint_status(
     expected_mbps: int | None,
 ) -> str:
     statuses: list[str] = []
+    is_public = False
     for direction in ("upload", "download"):
         result = group.get(direction)
         metrics = result.get("metrics", {}) if result else {}
+        endpoint = metrics.get("endpoint")
+        if isinstance(endpoint, dict) and endpoint.get("public"):
+            is_public = True
         speed = metrics.get("mbps")
         statuses.append(
             _throughput_status(float(speed), expected_mbps)
@@ -4135,7 +4217,10 @@ def _iperf_endpoint_status(
         )
         normalized = metrics.get("retransmits_per_gib")
         if isinstance(normalized, (int, float)):
-            statuses.append(_iperf_retransmission_status(float(normalized)))
+            retransmission_status = _iperf_retransmission_status(float(normalized))
+            if is_public and retransmission_status == "ПЛОХО":
+                retransmission_status = "ВНИМАНИЕ"
+            statuses.append(retransmission_status)
     return _worst_iperf_status(statuses)
 
 
@@ -4198,7 +4283,7 @@ def _tabular_result_section(
         ]
 
     if group == "ping":
-        target_width = min(45, max(18, total_width - 56))
+        target_width = min(45, max(18, total_width - 67))
         rows: list[list[Any]] = []
         no_reply: list[str] = []
         for result in results:
@@ -4209,6 +4294,7 @@ def _tabular_result_section(
             rows.append(
                 [
                     _result_target(result),
+                    metrics.get("transmitted", "—"),
                     _display_number(metrics.get("avg_ms"), " мс"),
                     _display_number(loss, "%"),
                     _display_number(metrics.get("jitter_ms"), " мс"),
@@ -4218,9 +4304,9 @@ def _tabular_result_section(
         lines = [
             "◆ PING ПО КАЖДОЙ ЦЕЛИ",
             *_semantic_table(
-                ["ЦЕЛЬ", "СР. RTT", "ПОТЕРИ", "РАЗБРОС", "СТАТУС"],
+                ["ЦЕЛЬ", "ЗАПРОСЫ", "СР. RTT", "ПОТЕРИ", "РАЗБРОС", "СТАТУС"],
                 rows,
-                [target_width, 11, 10, 11, 16],
+                [target_width, 9, 11, 10, 11, 16],
             ),
         ]
         if no_reply:
@@ -4347,17 +4433,25 @@ def _tabular_result_section(
                     _iperf_endpoint_status(endpoint, expected_mbps),
                 ]
             )
-        if total_width < 100:
-            point_width = max(17, total_width - 56)
-            compact_rows = [[row[0], row[1], row[2], row[3], row[4], row[6]] for row in rows]
-            table = _semantic_table(
-                ["ТОЧКА", "ПОТОКИ", "UPLOAD", "DOWNLOAD", "RETR/ГиБ U/D", "СТАТУС"],
-                compact_rows,
-                [point_width, 5, 9, 9, 13, 10],
-            )
-        elif total_width < 120:
-            point_width = max(17, total_width - 83)
-            table = _semantic_table(
+        def render_profile_table(profile_rows: list[list[Any]]) -> list[str]:
+            if total_width < 100:
+                point_width = max(17, total_width - 56)
+                compact_rows = [
+                    [row[0], row[1], row[2], row[3], row[4], row[6]]
+                    for row in profile_rows
+                ]
+                return _semantic_table(
+                    ["ТОЧКА", "ПОТОКИ", "UPLOAD", "DOWNLOAD", "RETR/ГиБ U/D", "СТАТУС"],
+                    compact_rows,
+                    [point_width, 5, 9, 9, 13, 10],
+                )
+            if total_width < 120:
+                point_width = max(17, total_width - 83)
+                widths = [point_width, 7, 12, 12, 17, 11, 12]
+            else:
+                point_width = min(43, max(24, total_width - 90))
+                widths = [point_width, 7, 13, 13, 18, 15, 12]
+            return _semantic_table(
                 [
                     "ТОЧКА",
                     "ПОТОКИ",
@@ -4367,25 +4461,28 @@ def _tabular_result_section(
                     "CPU U/D",
                     "СТАТУС",
                 ],
-                rows,
-                [point_width, 7, 12, 12, 17, 11, 12],
+                profile_rows,
+                widths,
             )
-        else:
-            point_width = min(43, max(24, total_width - 90))
-            table = _semantic_table(
+
+        profile_rows: dict[str, list[list[Any]]] = {}
+        for row in rows:
+            profile_rows.setdefault(str(row[1]), []).append(row)
+        profile_order = sorted(
+            profile_rows,
+            key=lambda value: int(value) if value.isdigit() else 999,
+        )
+        lines = ["◆ IPERF3 TCP ПО КАЖДОЙ ТОЧКЕ"]
+        for index, profile in enumerate(profile_order):
+            if index:
+                lines.append("")
+            suffix = "ПОТОК" if profile == "1" else "ПОТОКА"
+            lines.extend(
                 [
-                    "ТОЧКА",
-                    "ПОТОКИ",
-                    "UPLOAD",
-                    "DOWNLOAD",
-                    "TCP-ПОВТОРЫ/ГиБ",
-                    "CPU U/D",
-                    "СТАТУС",
-                ],
-                rows,
-                [point_width, 7, 13, 13, 18, 15, 12],
+                    f"◇ ПРОФИЛЬ: {profile} TCP-{suffix}",
+                    *render_profile_table(profile_rows[profile]),
+                ]
             )
-        lines = ["◆ IPERF3 TCP ПО КАЖДОЙ ТОЧКЕ", *table]
         skipped = list(
             dict.fromkeys(
                 str(item.get("summary"))
@@ -4394,6 +4491,20 @@ def _tabular_result_section(
             )
         )
         details = [f"! {item}" for item in skipped]
+        one_stream_speed = _representative_iperf_speed(
+            [item.get("metrics", {}) for item in measured if item.get("metrics", {}).get("streams") == 1]
+        )
+        four_stream_speed = _representative_iperf_speed(
+            [item.get("metrics", {}) for item in measured if item.get("metrics", {}).get("streams") == 4]
+        )
+        if one_stream_speed is not None and four_stream_speed is not None:
+            details.append(
+                f"· Один поток: {one_stream_speed:g} Мбит/с; четыре потока: {four_stream_speed:g} Мбит/с. Для ёмкости и общего балла используется профиль 4 потока."
+            )
+            if one_stream_speed < four_stream_speed * 0.55:
+                details.append(
+                    "! Один TCP-поток заметно медленнее четырёх: отдельное VPN-соединение может упираться в RTT, TCP-окно, маршрут или одно ядро."
+                )
         normalized_values = [
             float(item["metrics"]["retransmits_per_gib"])
             for item in results
@@ -4404,8 +4515,18 @@ def _tabular_result_section(
                 "· TCP-повторы показаны на 1 ГиБ: U — upload, D — download. Это повторно отправленные TCP-сегменты, а не точный процент потерь."
             )
             details.append(
-                "· Эвристика: до 500/ГиБ — хорошо; 501–5000 — внимание; больше 5000 — плохо. Публичную точку с предупреждением перепроверьте позже."
+                "· Эвристика: до 500/ГиБ — хорошо; 501–5000 — внимание; больше 5000 — плохо для своей контрольной точки."
             )
+            public_results = [
+                item
+                for item in results
+                if isinstance(item.get("metrics", {}).get("endpoint"), dict)
+                and item["metrics"]["endpoint"].get("public")
+            ]
+            if public_results:
+                details.append(
+                    "· На публичных серверах повторы имеют пониженный вес: причиной может быть загрузка самой точки. Высокое значение даёт предупреждение, а не автоматический красный итог."
+                )
             if max(normalized_values) > 5_000:
                 details.append(
                     "! Большое число повторов означает потери/перегрузку на пути или самой тестовой точки, даже если TCP сохранил высокую скорость повторной отправкой данных."
@@ -5068,6 +5189,11 @@ def _focused_verdict(test: str, results: list[dict[str, Any]], expected_mbps: in
             ]
             if jitters:
                 parts.append(f"разброс: {_display_number(max(jitters), ' мс')}")
+            counts = [int(item.get("transmitted", 0)) for item in samples]
+            if counts and max(counts) <= 1:
+                parts.append("разовый замер — стабильность не оценивается")
+            elif counts and max(counts) >= 100:
+                parts.append(f"расширенная выборка: {max(counts)} запросов")
             return label, " • ".join(parts)
     if test == "mtr" and measured:
         samples = [item.get("metrics", {}) for item in measured if "destination_loss_percent" in item.get("metrics", {})]
@@ -5092,17 +5218,22 @@ def _focused_verdict(test: str, results: list[dict[str, Any]], expected_mbps: in
             return "НЕ ПРОВЕРЕНО", "рабочая iperf3-точка не найдена; измерений скорости нет"
         weakest = _representative_iperf_speed(speed_measurements)
         assert weakest is not None
+        profile_text = (
+            " в профиле 4 потока"
+            if any(item.get("streams") == 4 for item in speed_measurements)
+            else ""
+        )
         both = {"upload", "download"} <= directions
         if expected_mbps > 0 and weakest >= expected_mbps:
-            label, text = "ХОРОШО", f"обе стороны достигают заданного ориентира {expected_mbps} Мбит/с"
+            label, text = "ХОРОШО", f"обе стороны{profile_text} достигают заданного ориентира {expected_mbps} Мбит/с"
         elif expected_mbps > 0 and weakest >= expected_mbps * 0.7:
-            label, text = "ВНИМАНИЕ", f"слабейшее направление даёт {weakest:g} Мбит/с — немного ниже ориентира {expected_mbps}"
+            label, text = "ВНИМАНИЕ", f"слабейшее направление{profile_text} даёт {weakest:g} Мбит/с — немного ниже ориентира {expected_mbps}"
         elif expected_mbps > 0:
-            label, text = "ПЛОХО", f"слабейшее направление даёт {weakest:g} Мбит/с при ориентире {expected_mbps}"
+            label, text = "ПЛОХО", f"слабейшее направление{profile_text} даёт {weakest:g} Мбит/с при ориентире {expected_mbps}"
         else:
             label = _throughput_status(weakest, None)
             text = (
-                f"автооценка: {weakest:g} Мбит/с в слабейшем направлении — "
+                f"автооценка: {weakest:g} Мбит/с в слабейшем направлении{profile_text} — "
                 f"{_automatic_speed_description(weakest)}"
             )
         representative_retransmits = _representative_iperf_retransmits_per_gib(
@@ -5114,11 +5245,20 @@ def _focused_verdict(test: str, results: list[dict[str, Any]], expected_mbps: in
         )
         if representative_retransmits is not None:
             retransmission_status = _iperf_retransmission_status(representative_retransmits)
+            public_measurement = _iperf_measurements_are_public(speed_measurements)
             text += f" • TCP-повторы: {representative_retransmits:g}/ГиБ"
-            if retransmission_status == "ПЛОХО":
+            if retransmission_status == "ПЛОХО" and public_measurement:
+                if label == "ХОРОШО":
+                    label = "ВНИМАНИЕ"
+                text += " — высокая нагрузка могла быть на публичной точке; перепроверьте позже"
+            elif retransmission_status == "ПЛОХО":
                 label = "ПЛОХО"
                 text += " — слишком много"
-            elif retransmission_status == "ВНИМАНИЕ" and label == "ХОРОШО":
+            elif (
+                retransmission_status == "ВНИМАНИЕ"
+                and label == "ХОРОШО"
+                and not public_measurement
+            ):
                 label = "ВНИМАНИЕ"
                 text += " — выше спокойного уровня"
         if not both:
@@ -5302,9 +5442,7 @@ def render_focused_report(report: dict[str, Any], test: str, include_raw: bool =
                     ),
                 ]
             )
-        lines.append(
-            f"  Параллельных TCP-потоков: {report.get('settings', {}).get('iperf_streams', 'не указано')}"
-        )
+        lines.append("  Профили TCP-потоков: 1 и 4 — выполняются автоматически")
     lines.extend(_dependency_notice_lines(report))
     lines.append("")
     sections = _result_sections(results, expected)
@@ -5573,7 +5711,7 @@ def show_test_explanations(*, color_output: bool = True) -> None:
         ],
         [
             "Ping",
-            "Показывает задержку до цели, потери пакетов и разброс задержки. Чем меньше RTT и разброс, тем отзывчивее соединение; потери желательно 0%.",
+            "Показывает задержку до цели, потери пакетов и разброс задержки. Чем меньше RTT и разброс, тем лучше. Перед запуском можно выбрать 1 запрос для мгновенной пробы, 20 для обычного теста или 200 для оценки стабильности; один запрос потери и разброс надёжно не оценивает.",
         ],
         [
             "MTR",
@@ -5593,7 +5731,7 @@ def show_test_explanations(*, color_output: bool = True) -> None:
         ],
         [
             "iperf3 TCP",
-            "Измеряет реальную скорость передачи между проверяемой машиной и отдельным iperf3-сервером в обе стороны. Сравнивайте загрузку и отдачу с заданным ориентиром и перепроверяйте слабую публичную точку.",
+            "Измеряет upload и download автоматически с 1 и 4 TCP-потоками. Один поток показывает скорость отдельного соединения, четыре — общую ёмкость канала. TCP-повторы публичных точек имеют пониженный вес, потому что сама точка может быть перегружена.",
         ],
         [
             "iperf3 UDP",
@@ -5852,7 +5990,7 @@ def interactive_test_selection(*, color_output: bool = True) -> set[str] | None:
             "   6. Доступность TCP- и UDP-порта\n"
             "   7. Path MTU — диагностика размера пакетов туннеля\n\n"
             f"{_menu_category('СКОРОСТЬ И КАЧЕСТВО КАНАЛА', colored=use_menu_color)}\n"
-            "   8. iperf3 TCP — скорость загрузки и отдачи\n"
+            "   8. iperf3 TCP — upload/download с 1 и 4 потоками\n"
             "   9. iperf3 UDP — потери и jitter до своего сервера\n"
             "  10. Длительный тест — 5 минут стабильности и burst-лимитов\n\n"
             f"{_menu_category('ЖЕЛЕЗО И СИСТЕМА', colored=use_menu_color)}\n"
@@ -5910,11 +6048,16 @@ def interactive_config(args: argparse.Namespace) -> AuditConfig | None:
             "\niperf3 не найден. Тест скорости будет отмечен как «не проверено», "
             "а в результате появится инструкция установки."
         )
-    if "iperf" in tests and iperf_available:
-        iperf_streams = int(
-            _prompt("Сколько параллельных TCP-потоков использовать", str(args.iperf_streams))
+    ping_count = args.ping_count
+    if "ping" in tests:
+        print(
+            "\nКоличество ping-запросов:\n"
+            "  1 — разовая проверка задержки\n"
+            "  20 — обычная короткая проверка\n"
+            "  200 — расширенная проверка стабильности"
         )
-        validate_positive("TCP-потоки", iperf_streams, 1, 32)
+        ping_count = int(_prompt("Сколько ping-запросов отправить", str(args.ping_count)))
+        validate_positive("Ping-запросы", ping_count, 1, 1_000)
     tcp_port = args.tcp_port
     if tests & {"tcp", "soak"}:
         tcp_port = int(
@@ -5958,14 +6101,6 @@ def interactive_config(args: argparse.Namespace) -> AuditConfig | None:
                 if not endpoint:
                     raise ValueError("Для проверки burst-лимита нужен свой iperf3-сервер")
                 soak_iperf_host, soak_iperf_port = parse_host_port(endpoint)
-                if "iperf" not in tests:
-                    iperf_streams = int(
-                        _prompt(
-                            "Сколько параллельных TCP-потоков использовать",
-                            str(args.iperf_streams),
-                        )
-                    )
-                    validate_positive("TCP-потоки", iperf_streams, 1, 32)
             elif soak_choice != "1":
                 raise ValueError("Для длительного теста выберите 1 или 2")
     udp_mbps = args.udp_mbps
@@ -5993,7 +6128,7 @@ def interactive_config(args: argparse.Namespace) -> AuditConfig | None:
         udp_mbps=udp_mbps,
         expected_mbps=expected,
         output_dir=pathlib.Path(args.output_dir),
-        ping_count=30 if "mtr" in tests else 20,
+        ping_count=ping_count,
         tcp_port=tcp_port,
         soak_seconds=soak_seconds,
         soak_interval_seconds=args.soak_interval,
@@ -6044,7 +6179,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--iperf-streams",
         type=int,
         default=4,
-        help="Число параллельных TCP-потоков iperf3 (-P)",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--udp-mbps", type=int, default=50)
     parser.add_argument(
@@ -6056,7 +6191,12 @@ def build_parser() -> argparse.ArgumentParser:
             "по фактическому каналу"
         ),
     )
-    parser.add_argument("--ping-count", type=int, default=20)
+    parser.add_argument(
+        "--ping-count",
+        type=int,
+        default=20,
+        help="Число запросов обычного ping: 1 для разовой проверки, 200 для стабильности",
+    )
     parser.add_argument(
         "--tcp-port",
         type=int,
@@ -6110,7 +6250,7 @@ def validate_cli_settings(args: argparse.Namespace) -> None:
     validate_positive("--iperf-streams", args.iperf_streams, 1, 32)
     validate_positive("--udp-mbps", args.udp_mbps, 1, 100_000)
     validate_positive("--expected-mbps", args.expected_mbps, 0, 100_000)
-    validate_positive("--ping-count", args.ping_count, 3, 300)
+    validate_positive("--ping-count", args.ping_count, 1, 1_000)
     validate_positive("--tcp-port", args.tcp_port, 1, 65535)
     validate_positive("--soak-seconds", args.soak_seconds, 60, 3600)
     validate_positive("--soak-interval", args.soak_interval, 5, 60)
