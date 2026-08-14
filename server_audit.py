@@ -39,7 +39,7 @@ import urllib.request
 from typing import Any
 
 
-VERSION = "1.16.0"
+VERSION = "1.17.0"
 DEFAULT_TARGETS = ["1.1.1.1", "dns.google"]
 DEFAULT_REPORT_DIR = "server-audit-reports"
 IPERF_TCP_STREAM_PROFILES = (1, 4)
@@ -934,16 +934,99 @@ def parse_iperf_json(output: str, *, udp: bool = False) -> dict[str, Any]:
 
 
 def parse_openssl_speed(output: str) -> float | None:
+    """Return decimal MB/s from OpenSSL speed output.
+
+    Prefer the machine-readable ``+F:`` summary. The human fallback requires
+    an actual throughput suffix so digits in cipher names or error messages
+    (AES-256-GCM, ChaCha20-Poly1305) can never be mistaken for a benchmark.
+    """
     for line in reversed(output.splitlines()):
-        if not re.search(r"(?:AES-256-GCM|ChaCha20-Poly1305)", line, re.IGNORECASE):
+        if not line.startswith("+F:") or not re.search(
+            r"(?:AES-256-GCM|ChaCha20-Poly1305)", line, re.IGNORECASE
+        ):
             continue
-        tokens = re.findall(r"([\d.]+)([kKmMgG]?)", line)
+        fields = line.split(":")
+        for field in reversed(fields):
+            try:
+                bytes_per_second = float(field)
+            except ValueError:
+                continue
+            if math.isfinite(bytes_per_second) and bytes_per_second > 0:
+                return bytes_per_second / 1_000_000
+
+    for line in reversed(output.splitlines()):
+        match = re.match(
+            r"^\s*(?:AES-256-GCM|ChaCha20-Poly1305)\s+(.+?)\s*$",
+            line,
+            re.IGNORECASE,
+        )
+        if not match:
+            continue
+        tokens = re.findall(r"(?<![\w.-])(\d+(?:[.,]\d+)?)([kKmMgG])(?:\s|$)", match.group(1))
         if not tokens:
             continue
         value, suffix = tokens[-1]
-        multiplier = {"": 1.0, "k": 1_000.0, "m": 1_000_000.0, "g": 1_000_000_000.0}
-        return float(value) * multiplier[suffix.lower()] / 1_000_000
+        multiplier = {"k": 1_000.0, "m": 1_000_000.0, "g": 1_000_000_000.0}
+        bytes_per_second = float(value.replace(",", ".")) * multiplier[suffix.lower()]
+        if math.isfinite(bytes_per_second) and bytes_per_second > 0:
+            return bytes_per_second / 1_000_000
     return None
+
+
+def _crypto_benchmark_assessment(mbps: float | None) -> tuple[str, str]:
+    if mbps is None or not math.isfinite(mbps) or mbps <= 0:
+        return "failed", "Скорость шифрования не измерена"
+    if mbps < 500:
+        return "bad", "Очень низкая однопоточная скорость шифрования"
+    if mbps < 1_500:
+        return "warning", "Скорость достаточна только для умеренной VPN-нагрузки"
+    return "ok", "Хорошая однопоточная скорость шифрования"
+
+
+def _crypto_benchmark_score(mbps: float) -> float:
+    points = [
+        (0.0, 0.0),
+        (250.0, 15.0),
+        (500.0, 35.0),
+        (1_000.0, 60.0),
+        (1_500.0, 75.0),
+        (3_000.0, 90.0),
+        (5_000.0, 100.0),
+    ]
+    value = max(0.0, mbps)
+    for index in range(1, len(points)):
+        lower_speed, lower_score = points[index - 1]
+        upper_speed, upper_score = points[index]
+        if value <= upper_speed:
+            share = (value - lower_speed) / (upper_speed - lower_speed)
+            return lower_score + share * (upper_score - lower_score)
+    return 100.0
+
+
+def _finalize_crypto_benchmark(item: TestResult) -> TestResult:
+    if item.status != "ok":
+        return item
+    mb_per_sec = parse_openssl_speed(item.output)
+    throughput_mbps = mb_per_sec * 8 if mb_per_sec is not None else None
+    status, assessment = _crypto_benchmark_assessment(throughput_mbps)
+    if throughput_mbps is None:
+        item.status = "failed"
+        item.summary = (
+            "OpenSSL завершился без распознаваемой положительной скорости; "
+            "результат не засчитан"
+        )
+        return item
+    item.metrics.update(
+        mb_per_sec=round(mb_per_sec, 2),
+        throughput_mbps=round(throughput_mbps, 2),
+        estimated_gbps=round(throughput_mbps / 1_000, 4),
+    )
+    item.status = status
+    item.summary = (
+        f"{throughput_mbps:.1f} Мбит/с на блоках 16 KiB "
+        f"(синтетика одного процесса) — {assessment.lower()}"
+    )
+    return item
 
 
 def _ping_assessment(metrics: dict[str, Any]) -> tuple[str, str]:
@@ -2467,6 +2550,82 @@ def _read_text(path: str) -> str:
         return ""
 
 
+def _sysctl_value(text: str, *names: str) -> str | None:
+    for name in names:
+        match = re.search(
+            rf"^{re.escape(name)}\s*(?:=|:)\s*(\S+)\s*$",
+            text,
+            re.MULTILINE,
+        )
+        if match:
+            return match.group(1).strip()
+    return None
+
+
+def _first_positive_integer_file(paths: tuple[str, ...], *, allow_zero: bool) -> tuple[str | None, str | None]:
+    for path in paths:
+        value = _read_text(path).strip()
+        if not re.fullmatch(r"\d+", value):
+            continue
+        if allow_zero or int(value) > 0:
+            return value, path
+    return None, None
+
+
+def _conntrack_metrics(sysctl_text: str) -> dict[str, Any]:
+    count = _sysctl_value(
+        sysctl_text,
+        "net.netfilter.nf_conntrack_count",
+        "net.ipv4.netfilter.ip_conntrack_count",
+    )
+    maximum = _sysctl_value(
+        sysctl_text,
+        "net.netfilter.nf_conntrack_max",
+        "net.ipv4.netfilter.ip_conntrack_max",
+    )
+    sources: list[str] = []
+    if count is not None or maximum is not None:
+        sources.append("sysctl")
+    if count is None:
+        count, source = _first_positive_integer_file(
+            (
+                "/proc/sys/net/netfilter/nf_conntrack_count",
+                "/proc/sys/net/ipv4/netfilter/ip_conntrack_count",
+            ),
+            allow_zero=True,
+        )
+        if source:
+            sources.append("procfs")
+    if maximum is None:
+        maximum, source = _first_positive_integer_file(
+            (
+                "/proc/sys/net/netfilter/nf_conntrack_max",
+                "/proc/sys/net/ipv4/netfilter/ip_conntrack_max",
+            ),
+            allow_zero=False,
+        )
+        if source:
+            sources.append("procfs")
+
+    utilization = None
+    if count is not None and maximum is not None and int(maximum) > 0:
+        utilization = round(int(count) / int(maximum) * 100, 2)
+    if count is None or maximum is None:
+        note = (
+            "счётчики ядра недоступны: nf_conntrack может быть не загружен, "
+            "не использоваться или быть скрыт контейнером/провайдером"
+        )
+    else:
+        note = None
+    return {
+        "nf_conntrack_count": count,
+        "nf_conntrack_max": maximum,
+        "nf_conntrack_utilization_percent": utilization,
+        "nf_conntrack_source": "+".join(dict.fromkeys(sources)) or None,
+        "nf_conntrack_note": note,
+    }
+
+
 def _public_ip(version: int) -> str | None:
     url = "https://api6.ipify.org" if version == 6 else "https://api4.ipify.org"
     family = socket.AF_INET6 if version == 6 else socket.AF_INET
@@ -2567,8 +2726,8 @@ def system_inventory(runner: CommandRunner, benchmark: bool = True) -> list[Test
     raw_sections: list[str] = []
     for args, key in commands:
         item = runner.run(f"Инвентаризация: {key}", "system-detail", args, timeout=10, env=_base_environment())
-        if item.status == "ok":
-            value = item.output.strip()
+        value = item.output.strip()
+        if item.status == "ok" or (key == "network_sysctl" and value):
             metrics[key] = value
             raw_sections.append(f"$ {item.command}\n{value}")
         else:
@@ -2577,11 +2736,9 @@ def system_inventory(runner: CommandRunner, benchmark: bool = True) -> list[Test
     for source, destination in (
         ("net.ipv4.tcp_congestion_control", "tcp_congestion_control"),
         ("net.core.default_qdisc", "default_qdisc"),
-        ("net.netfilter.nf_conntrack_count", "nf_conntrack_count"),
-        ("net.netfilter.nf_conntrack_max", "nf_conntrack_max"),
     ):
-        match = re.search(rf"^{re.escape(source)}\s*=\s*(.+)$", sysctl_text, re.MULTILINE)
-        metrics[destination] = match.group(1).strip() if match else None
+        metrics[destination] = _sysctl_value(sysctl_text, source)
+    metrics.update(_conntrack_metrics(sysctl_text))
     summary = (
         f"{cpu.get('logical_cpus') or '?'} vCPU, "
         f"RAM {_human_bytes(memory.get('MemTotal', 0))}, "
@@ -2618,16 +2775,22 @@ def system_inventory(runner: CommandRunner, benchmark: bool = True) -> list[Test
             item = runner.run(
                 f"OpenSSL {label} benchmark",
                 "crypto",
-                ["openssl", "speed", "-elapsed", "-seconds", "3", "-bytes", "16384", "-evp", cipher],
+                [
+                    "openssl",
+                    "speed",
+                    "-elapsed",
+                    "-seconds",
+                    "3",
+                    "-bytes",
+                    "16384",
+                    "-evp",
+                    cipher,
+                    "-mr",
+                ],
                 timeout=10,
                 env=_base_environment(),
             )
-            mb_per_sec = parse_openssl_speed(item.output)
-            if mb_per_sec is not None:
-                item.metrics.update(mb_per_sec=round(mb_per_sec, 2), estimated_gbps=round(mb_per_sec * 8 / 1000, 2))
-                item.status = "ok"
-                item.summary = f"{mb_per_sec:.1f} MB/s на блоках 16 KiB (синтетика одного процесса)"
-            results.append(item)
+            results.append(_finalize_crypto_benchmark(item))
     return results
 
 
@@ -2857,7 +3020,20 @@ def calculate_score(
         if result.category == "udp" and "loss_percent" in result.metrics
     ]
     vmstats = [result.metrics for result in results if "steal_avg_percent" in result.metrics]
-    crypto = [result.metrics for result in results if result.category == "crypto" and "estimated_gbps" in result.metrics]
+    conntrack_stats = [
+        result.metrics
+        for result in results
+        if isinstance(result.metrics.get("nf_conntrack_utilization_percent"), (int, float))
+    ]
+    crypto = [
+        result.metrics
+        for result in results
+        if result.category == "crypto"
+        and (
+            isinstance(result.metrics.get("throughput_mbps"), (int, float))
+            or isinstance(result.metrics.get("estimated_gbps"), (int, float))
+        )
+    ]
 
     dimensions: dict[str, float] = {}
     timed_pings = [item for item in pings if "avg_ms" in item]
@@ -2907,14 +3083,25 @@ def calculate_score(
         system_parts.append(
             _piecewise_lower_better(steal, [(0.5, 100), (1, 90), (2, 75), (5, 40), (10, 10), (math.inf, 0)])
         )
-    if crypto:
-        weakest_crypto_mbps = min(float(item["estimated_gbps"]) * 1000 for item in crypto)
-        crypto_score = (
-            _throughput_score(weakest_crypto_mbps, expected_mbps * 1.5)
-            if expected_mbps > 0
-            else _automatic_throughput_score(weakest_crypto_mbps)
+    if conntrack_stats:
+        utilization = max(
+            float(item["nf_conntrack_utilization_percent"])
+            for item in conntrack_stats
         )
-        system_parts.append(crypto_score)
+        system_parts.append(
+            _piecewise_lower_better(
+                utilization,
+                [(50, 100), (70, 90), (85, 60), (95, 20), (100, 0), (math.inf, 0)],
+            )
+        )
+    if crypto:
+        weakest_crypto_mbps = min(
+            float(item["throughput_mbps"])
+            if isinstance(item.get("throughput_mbps"), (int, float))
+            else float(item["estimated_gbps"]) * 1000
+            for item in crypto
+        )
+        system_parts.append(_crypto_benchmark_score(weakest_crypto_mbps))
     if system_parts:
         dimensions["system"] = round(statistics.mean(system_parts), 1)
 
@@ -2984,6 +3171,14 @@ def calculate_score(
             )
         if float(result.metrics.get("steal_avg_percent", 0)) >= 2:
             warnings.append("CPU steal ≥ 2%: VPS может быть перепродан или соседние VM создают помехи")
+        if result.category == "crypto" and result.status in {"warning", "bad", "failed"}:
+            warnings.append(f"{result.name}: {result.summary}")
+        conntrack_utilization = result.metrics.get("nf_conntrack_utilization_percent")
+        if isinstance(conntrack_utilization, (int, float)) and float(conntrack_utilization) >= 70:
+            warnings.append(
+                f"Conntrack заполнен на {float(conntrack_utilization):g}%: "
+                "при достижении лимита новые соединения начнут теряться"
+            )
         if result.category in {"ipinfo", "access", "dpi", "dnscheck"} and result.status in {"warning", "bad"}:
             warnings.append(result.summary)
         if result.category == "tcp" and result.status == "failed":
@@ -4092,6 +4287,23 @@ def _result_status(result: dict[str, Any]) -> str:
     return DISPLAY_STATUS.get(str(result.get("status", "failed")), "НЕ ПРОВЕРЕНО")
 
 
+def _crypto_throughput_mbps(metrics: dict[str, Any]) -> float | None:
+    value = metrics.get("throughput_mbps")
+    if isinstance(value, (int, float)):
+        return float(value)
+    legacy = metrics.get("estimated_gbps")
+    if isinstance(legacy, (int, float)):
+        return float(legacy) * 1_000
+    return None
+
+
+def _crypto_display_status(result: dict[str, Any], speed_mbps: float | None) -> str:
+    if result.get("status") in {"failed", "skipped"}:
+        return _result_status(result)
+    status, _ = _crypto_benchmark_assessment(speed_mbps)
+    return DISPLAY_STATUS.get(status, "ОШИБКА")
+
+
 def _throughput_status(speed: float, expected_mbps: int | None) -> str:
     if not expected_mbps:
         if speed >= 300:
@@ -4702,6 +4914,34 @@ def _tabular_result_section(
                 swap_value = f"всего {_human_bytes(metrics.get('swaptotal_bytes', 0))}"
                 if metrics.get("swapfree_bytes") is not None:
                     swap_value += f", свободно {_human_bytes(metrics['swapfree_bytes'])}"
+                conntrack_count = metrics.get("nf_conntrack_count")
+                conntrack_max = metrics.get("nf_conntrack_max")
+                conntrack_utilization = metrics.get("nf_conntrack_utilization_percent")
+                if (
+                    not isinstance(conntrack_utilization, (int, float))
+                    and str(conntrack_count).isdigit()
+                    and str(conntrack_max).isdigit()
+                    and int(str(conntrack_max)) > 0
+                ):
+                    conntrack_utilization = round(
+                        int(str(conntrack_count)) / int(str(conntrack_max)) * 100,
+                        2,
+                    )
+                conntrack_value = (
+                    f"{conntrack_count} / {conntrack_max}"
+                    if conntrack_count is not None and conntrack_max is not None
+                    else "не определено"
+                )
+                if isinstance(conntrack_utilization, (int, float)):
+                    conntrack_value += f" ({float(conntrack_utilization):g}% заполнено)"
+                    if float(conntrack_utilization) >= 90:
+                        conntrack_status = "ПЛОХО"
+                    elif float(conntrack_utilization) >= 70:
+                        conntrack_status = "ВНИМАНИЕ"
+                    else:
+                        conntrack_status = "ХОРОШО"
+                else:
+                    conntrack_status = "НЕ ОПРЕДЕЛЕНО"
                 rows.extend(
                     [
                         ["ОС", metrics.get("os") or "не определена", "ИЗМЕРЕНО"],
@@ -4746,13 +4986,8 @@ def _tabular_result_section(
                         ],
                         [
                             "Conntrack сейчас / максимум",
-                            f"{metrics.get('nf_conntrack_count') or 'не определено'} / {metrics.get('nf_conntrack_max') or 'не определено'}",
-                            (
-                                "ИЗМЕРЕНО"
-                                if metrics.get("nf_conntrack_count") is not None
-                                and metrics.get("nf_conntrack_max") is not None
-                                else "НЕ ОПРЕДЕЛЕНО"
-                            ),
+                            conntrack_value,
+                            conntrack_status,
                         ],
                         [
                             "NTP синхронизация",
@@ -4761,6 +4996,14 @@ def _tabular_result_section(
                         ],
                     ]
                 )
+                if metrics.get("nf_conntrack_note"):
+                    rows.append(
+                        [
+                            "Conntrack пояснение",
+                            metrics["nf_conntrack_note"],
+                            "СПРАВОЧНО",
+                        ]
+                    )
             elif "steal_avg_percent" in metrics:
                 rows.append(
                     [
@@ -4769,13 +5012,18 @@ def _tabular_result_section(
                         _result_status(result),
                     ]
                 )
-            elif result.get("category") == "crypto" and "estimated_gbps" in metrics:
+            elif result.get("category") == "crypto":
                 cipher = "AES-256-GCM" if "AES" in str(result.get("name")) else "ChaCha20-Poly1305"
+                crypto_mbps = _crypto_throughput_mbps(metrics)
                 rows.append(
                     [
                         f"{cipher} (1 поток, 3 с)",
-                        _display_number(float(metrics["estimated_gbps"]) * 1000, " Мбит/с", 0),
-                        _result_status(result),
+                        (
+                            _display_number(crypto_mbps, " Мбит/с", 0)
+                            if crypto_mbps is not None and crypto_mbps > 0
+                            else result.get("summary", "скорость не измерена")
+                        ),
+                        _crypto_display_status(result, crypto_mbps),
                     ]
                 )
             else:
@@ -5137,11 +5385,18 @@ def _result_card(result: dict[str, Any], expected_mbps: int | None = None) -> li
                 f"  IPv6            {metrics.get('public_ipv6') or 'не определён'}",
             ]
 
-    if category == "crypto" and "estimated_gbps" in metrics:
+    if category == "crypto":
         cipher = "AES" if "AES" in name else "ChaCha20"
+        crypto_mbps = _crypto_throughput_mbps(metrics)
+        if crypto_mbps is None or crypto_mbps <= 0:
+            return [
+                f"◆ ШИФРОВАНИЕ {cipher}",
+                f"ИТОГ [{_crypto_display_status(result, crypto_mbps)}]  "
+                f"{result.get('summary', 'скорость не измерена')}.",
+            ]
         return [
             f"◆ ШИФРОВАНИЕ {cipher}",
-            f"◆ ОДИН ПРОЦЕСС    {_display_number(float(metrics['estimated_gbps']) * 1000, ' Мбит/с', 0)}",
+            f"◆ ОДИН ПРОЦЕСС    {_display_number(crypto_mbps, ' Мбит/с', 0)}",
         ]
 
     if category == "ipinfo" and metrics:
@@ -5400,7 +5655,48 @@ def _focused_verdict(test: str, results: list[dict[str, Any]], expected_mbps: in
             parts = [f"{inventory.get('logical_cpus') or '?'} vCPU", f"RAM {_human_bytes(inventory.get('memtotal_bytes', 0))}"]
             if steal is not None:
                 parts.append(f"CPU steal {_display_number(steal, '%')}")
-            label = "ХОРОШО" if steal is None or float(steal) < 2 else "ВНИМАНИЕ"
+            crypto_results = [item for item in results if item.get("category") == "crypto"]
+            crypto_speeds = [
+                speed
+                for item in crypto_results
+                if (speed := _crypto_throughput_mbps(item.get("metrics", {}))) is not None
+                and speed > 0
+            ]
+            if crypto_speeds:
+                parts.append(f"шифрование от {_display_number(min(crypto_speeds), ' Мбит/с', 0)}")
+            elif crypto_results:
+                parts.append("шифрование не измерено")
+            if inventory.get("nf_conntrack_note"):
+                parts.append("conntrack недоступен ядру/контейнеру")
+            conntrack_utilization = inventory.get("nf_conntrack_utilization_percent")
+            if isinstance(conntrack_utilization, (int, float)):
+                parts.append(f"conntrack {_display_number(conntrack_utilization, '%')}")
+
+            if steal is not None and float(steal) >= 5:
+                label = "ПЛОХО"
+            elif steal is not None and float(steal) >= 2:
+                label = "ВНИМАНИЕ"
+            else:
+                label = "ХОРОШО"
+            crypto_states = [
+                (
+                    item.get("status")
+                    if item.get("status") in {"failed", "skipped"}
+                    else _crypto_benchmark_assessment(
+                        _crypto_throughput_mbps(item.get("metrics", {}))
+                    )[0]
+                )
+                for item in crypto_results
+            ]
+            if "bad" in crypto_states:
+                label = "ПЛОХО"
+            elif set(crypto_states) & {"warning", "failed", "skipped"} and label == "ХОРОШО":
+                label = "ВНИМАНИЕ"
+            if isinstance(conntrack_utilization, (int, float)):
+                if float(conntrack_utilization) >= 90:
+                    label = "ПЛОХО"
+                elif float(conntrack_utilization) >= 70 and label == "ХОРОШО":
+                    label = "ВНИМАНИЕ"
             return label, " • ".join(parts)
     if not measured:
         return "НЕ ПРОВЕРЕНО", "измерение не выполнено; причина указана ниже"
