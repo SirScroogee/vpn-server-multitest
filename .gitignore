@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+server-audit-reports/
+audit_*.txt
