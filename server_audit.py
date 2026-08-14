@@ -39,7 +39,7 @@ import urllib.request
 from typing import Any
 
 
-VERSION = "1.14.0"
+VERSION = "1.15.0"
 DEFAULT_TARGETS = ["1.1.1.1", "dns.google"]
 DEFAULT_REPORT_DIR = "server-audit-reports"
 RU_IPERF_CATALOG_URL = (
@@ -232,7 +232,9 @@ class AuditConfig:
     iperf_seconds: int = 10
     iperf_streams: int = 4
     udp_mbps: int = 50
-    expected_mbps: int = 300
+    # 0 enables the default automatic speed assessment. A positive value is a
+    # user-supplied tariff/workload target kept for CLI and API compatibility.
+    expected_mbps: int = 0
     output_dir: pathlib.Path = pathlib.Path(DEFAULT_REPORT_DIR)
     ping_count: int = 20
     tcp_port: int = 443
@@ -1506,9 +1508,10 @@ def _network_soak_iperf_result(
         speed = float(metrics["mbps"])
         variation = float(metrics.get("interval_cv_percent", 0))
         sustained_drop = float(metrics.get("sustained_drop_percent", 0))
-        if speed < expected_mbps * 0.7 or sustained_drop >= 40:
+        speed_status = _throughput_status(speed, expected_mbps)
+        if speed_status == "ПЛОХО" or sustained_drop >= 40:
             status = "bad"
-        elif speed < expected_mbps or sustained_drop >= 20 or variation >= 20:
+        elif speed_status == "ВНИМАНИЕ" or sustained_drop >= 20 or variation >= 20:
             status = "warning"
         else:
             status = "ok"
@@ -1538,7 +1541,7 @@ def run_network_soak(
     iperf_host: str | None = None,
     iperf_port: int = 5201,
     streams: int = 4,
-    expected_mbps: int = 300,
+    expected_mbps: int = 0,
 ) -> list[TestResult]:
     """Observe latency/TCP throughout the run and optionally load the path with iperf3."""
     interval_seconds = max(1, interval_seconds)
@@ -2655,6 +2658,91 @@ def _throughput_score(mbps: float, expected: float) -> float:
     return 100.0
 
 
+def _automatic_throughput_score(mbps: float) -> float:
+    """Score measured VPN-path throughput without pretending to know the tariff.
+
+    The bands are deliberately broad. They describe practical server classes,
+    not a guaranteed number of customers or the nominal speed of a VPS NIC.
+    """
+    points = [
+        (0.0, 0.0),
+        (25.0, 15.0),
+        (50.0, 30.0),
+        (100.0, 50.0),
+        (200.0, 70.0),
+        (300.0, 80.0),
+        (500.0, 90.0),
+        (1_000.0, 100.0),
+    ]
+    value = max(0.0, mbps)
+    for index in range(1, len(points)):
+        lower_speed, lower_score = points[index - 1]
+        upper_speed, upper_score = points[index]
+        if value <= upper_speed:
+            share = (value - lower_speed) / (upper_speed - lower_speed)
+            return lower_score + share * (upper_score - lower_score)
+    return 100.0
+
+
+def _effective_throughput_score(mbps: float, expected_mbps: int | None) -> float:
+    if expected_mbps and expected_mbps > 0:
+        return _throughput_score(mbps, expected_mbps)
+    return _automatic_throughput_score(mbps)
+
+
+def _representative_iperf_speed(measurements: list[dict[str, Any]]) -> float | None:
+    """Return the weaker direction, using public-server medians when possible."""
+    comparable = [item for item in measurements if isinstance(item.get("mbps"), (int, float))]
+    if not comparable:
+        return None
+    public = [
+        item
+        for item in comparable
+        if isinstance(item.get("endpoint"), dict) and item["endpoint"].get("public")
+    ]
+    selected = public or comparable
+    direction_medians: list[float] = []
+    for direction in ("upload", "download"):
+        values = [
+            float(item["mbps"])
+            for item in selected
+            if item.get("direction") == direction
+        ]
+        if values:
+            direction_medians.append(statistics.median(values))
+    if direction_medians:
+        return min(direction_medians)
+    return min(float(item["mbps"]) for item in selected)
+
+
+def _vpn_capacity_estimate(mbps: float, reserve_percent: int = 30) -> dict[str, Any]:
+    """Estimate simultaneous active traffic consumers, not total VPN accounts."""
+    usable_mbps = max(0.0, mbps) * (100 - reserve_percent) / 100
+    return {
+        "measured_mbps": round(max(0.0, mbps), 1),
+        "usable_mbps": round(usable_mbps, 1),
+        "reserve_percent": reserve_percent,
+        "active_users": {
+            per_user: math.floor(usable_mbps / per_user)
+            for per_user in (10, 25, 50)
+        },
+    }
+
+
+def _automatic_speed_description(mbps: float) -> str:
+    if mbps >= 1_000:
+        return "отличный канал для крупной VPN-ноды"
+    if mbps >= 500:
+        return "очень хороший канал для VPN-ноды"
+    if mbps >= 300:
+        return "хороший канал для обычной VPN-ноды"
+    if mbps >= 100:
+        return "достаточно для небольшой или средней VPN-ноды"
+    if mbps >= 50:
+        return "подойдёт только для небольшой нагрузки"
+    return "слишком мало для комфортной многопользовательской VPN-ноды"
+
+
 def _iperf_retransmission_status(retransmits_per_gib: float | None) -> str:
     """Return a human status for a comparable, volume-normalized TCP metric.
 
@@ -2766,27 +2854,9 @@ def calculate_score(
             )
             dimensions["stability"] = round(loss_score * 0.7 + jitter_score * 0.3, 1)
     if iperfs:
-        public_measurements = [
-            item
-            for item in iperfs
-            if isinstance(item.get("endpoint"), dict) and item["endpoint"].get("public")
-        ]
-        if public_measurements:
-            direction_medians = []
-            for direction in ("upload", "download"):
-                values = [
-                    float(item["mbps"])
-                    for item in public_measurements
-                    if item.get("direction") == direction
-                ]
-                if values:
-                    direction_medians.append(statistics.median(values))
-            weakest_direction = min(direction_medians) if direction_medians else min(
-                float(item["mbps"]) for item in iperfs
-            )
-        else:
-            weakest_direction = min(float(item["mbps"]) for item in iperfs)
-        speed_score = _throughput_score(weakest_direction, expected_mbps)
+        weakest_direction = _representative_iperf_speed(iperfs)
+        assert weakest_direction is not None
+        speed_score = _effective_throughput_score(weakest_direction, expected_mbps)
         representative_retransmits = _representative_iperf_retransmits_per_gib(iperfs)
         if representative_retransmits is None:
             dimensions["throughput"] = round(speed_score, 1)
@@ -2801,7 +2871,12 @@ def calculate_score(
         )
     if crypto:
         weakest_crypto_mbps = min(float(item["estimated_gbps"]) * 1000 for item in crypto)
-        system_parts.append(_throughput_score(weakest_crypto_mbps, expected_mbps * 1.5))
+        crypto_score = (
+            _throughput_score(weakest_crypto_mbps, expected_mbps * 1.5)
+            if expected_mbps > 0
+            else _automatic_throughput_score(weakest_crypto_mbps)
+        )
+        system_parts.append(crypto_score)
     if system_parts:
         dimensions["system"] = round(statistics.mean(system_parts), 1)
 
@@ -2971,7 +3046,10 @@ def run_audit(config: AuditConfig, *, verbose: bool = True) -> dict[str, Any]:
     elif config.iperf_host:
         print(f"Отдельная iperf3-точка: {config.iperf_host}:{config.iperf_port}")
     if "iperf" in config.tests:
-        print(f"Ваш ориентир скорости: {config.expected_mbps} Мбит/с")
+        if config.expected_mbps > 0:
+            print(f"Ваш ручной ориентир скорости: {config.expected_mbps} Мбит/с")
+        else:
+            print("Оценка скорости: автоматическая — по фактическому каналу и TCP-повторам")
     if "system" in config.tests:
         results.extend(
             progress.run("Система, CPU и сетевой стек", 24, lambda: system_inventory(runner, benchmark=True))
@@ -3943,7 +4021,11 @@ def _result_status(result: dict[str, Any]) -> str:
 
 def _throughput_status(speed: float, expected_mbps: int | None) -> str:
     if not expected_mbps:
-        return "ИЗМЕРЕНО"
+        if speed >= 300:
+            return "ХОРОШО"
+        if speed >= 100:
+            return "ВНИМАНИЕ"
+        return "ПЛОХО"
     if speed >= expected_mbps:
         return "ХОРОШО"
     if speed >= expected_mbps * 0.7:
@@ -4995,7 +5077,10 @@ def _focused_verdict(test: str, results: list[dict[str, Any]], expected_mbps: in
             label = "ХОРОШО" if worst_loss <= 0.5 else "ВНИМАНИЕ" if worst_loss <= 2 else "ПЛОХО"
             return label, f"RTT до цели: {_display_number(worst_rtt, ' мс')} • потери до цели: {_display_number(worst_loss, '%')}"
     if test == "iperf":
-        speeds = [float(item["metrics"]["mbps"]) for item in results if "mbps" in item.get("metrics", {})]
+        speed_measurements = [
+            item["metrics"] for item in results if "mbps" in item.get("metrics", {})
+        ]
+        speeds = [float(item["mbps"]) for item in speed_measurements]
         directions = {item.get("metrics", {}).get("direction") for item in results if "mbps" in item.get("metrics", {})}
         if not speeds:
             missing_tool = any(
@@ -5005,14 +5090,21 @@ def _focused_verdict(test: str, results: list[dict[str, Any]], expected_mbps: in
             if missing_tool:
                 return "НЕ ПРОВЕРЕНО", "iperf3 не установлен — тест скорости вообще не запускался"
             return "НЕ ПРОВЕРЕНО", "рабочая iperf3-точка не найдена; измерений скорости нет"
-        weakest = min(speeds)
+        weakest = _representative_iperf_speed(speed_measurements)
+        assert weakest is not None
         both = {"upload", "download"} <= directions
-        if weakest >= expected_mbps:
+        if expected_mbps > 0 and weakest >= expected_mbps:
             label, text = "ХОРОШО", f"обе стороны достигают заданного ориентира {expected_mbps} Мбит/с"
-        elif weakest >= expected_mbps * 0.7:
+        elif expected_mbps > 0 and weakest >= expected_mbps * 0.7:
             label, text = "ВНИМАНИЕ", f"слабейшее направление даёт {weakest:g} Мбит/с — немного ниже ориентира {expected_mbps}"
-        else:
+        elif expected_mbps > 0:
             label, text = "ПЛОХО", f"слабейшее направление даёт {weakest:g} Мбит/с при ориентире {expected_mbps}"
+        else:
+            label = _throughput_status(weakest, None)
+            text = (
+                f"автооценка: {weakest:g} Мбит/с в слабейшем направлении — "
+                f"{_automatic_speed_description(weakest)}"
+            )
         representative_retransmits = _representative_iperf_retransmits_per_gib(
             [
                 item.get("metrics", {})
@@ -5182,12 +5274,34 @@ def _focused_verdict(test: str, results: list[dict[str, Any]], expected_mbps: in
 
 def render_focused_report(report: dict[str, Any], test: str, include_raw: bool = True) -> str:
     results = report.get("results", [])
-    expected = int(report.get("settings", {}).get("expected_mbps", 300))
+    expected = int(report.get("settings", {}).get("expected_mbps", 0))
     label, verdict = _focused_verdict(test, results, expected)
     lines = _title_banner(TEST_TITLES.get(test, "РЕЗУЛЬТАТ ПРОВЕРКИ"))
     lines.extend(["", f"ИТОГ [{label}]  {verdict}."])
     if test == "iperf" and any("mbps" in item.get("metrics", {}) for item in results):
-        lines.append(f"  Заданный ориентир: {expected} Мбит/с")
+        speed = _representative_iperf_speed(
+            [item.get("metrics", {}) for item in results]
+        )
+        if expected > 0:
+            lines.append(f"  Ручной ориентир: {expected} Мбит/с")
+        elif speed is not None:
+            capacity = _vpn_capacity_estimate(speed)
+            users = capacity["active_users"]
+            lines.extend(
+                [
+                    "  Режим оценки: автоматический",
+                    (
+                        f"  Полезный запас: ≈ {capacity['usable_mbps']:g} Мбит/с "
+                        f"после резерва {capacity['reserve_percent']}%"
+                    ),
+                    (
+                        "  Одновременно активны: "
+                        f"≈ {users[10]} чел. по 10 Мбит/с · "
+                        f"{users[25]} чел. по 25 Мбит/с · "
+                        f"{users[50]} чел. по 50 Мбит/с"
+                    ),
+                ]
+            )
         lines.append(
             f"  Параллельных TCP-потоков: {report.get('settings', {}).get('iperf_streams', 'не указано')}"
         )
@@ -5234,6 +5348,30 @@ def render_general_report(report: dict[str, Any], include_raw: bool = True) -> s
         ),
         ]
     )
+    expected = int(report.get("settings", {}).get("expected_mbps", 0))
+    iperf_speed = _representative_iperf_speed(
+        [
+            item.get("metrics", {})
+            for item in report.get("results", [])
+            if item.get("category") == "iperf"
+        ]
+    )
+    if iperf_speed is not None and expected <= 0:
+        capacity = _vpn_capacity_estimate(iperf_speed)
+        users = capacity["active_users"]
+        lines.extend(
+            [
+                (
+                    f"АВТООЦЕНКА КАНАЛА       {iperf_speed:g} Мбит/с в слабейшем "
+                    f"направлении — {_automatic_speed_description(iperf_speed)}"
+                ),
+                (
+                    f"РАСЧЁТНАЯ ЁМКОСТЬ       ≈ {users[10]} активных по 10 Мбит/с · "
+                    f"{users[25]} по 25 Мбит/с · {users[50]} по 50 Мбит/с "
+                    f"(резерв {capacity['reserve_percent']}%)"
+                ),
+            ]
+        )
     dimension_names = {
         "latency": "Задержка",
         "stability": "Стабильность",
@@ -5246,7 +5384,6 @@ def render_general_report(report: dict[str, Any], include_raw: bool = True) -> s
             lines.append(f"◆ {dimension_names.get(key, key).upper():<24} {value:.1f}/100")
     lines.extend(_dependency_notice_lines(report))
     lines.extend(["", _divider(), ""])
-    expected = int(report.get("settings", {}).get("expected_mbps", 300))
     sections = _result_sections(report["results"], expected)
     for index, section in enumerate(sections):
         if index:
@@ -5774,8 +5911,6 @@ def interactive_config(args: argparse.Namespace) -> AuditConfig | None:
             "а в результате появится инструкция установки."
         )
     if "iperf" in tests and iperf_available:
-        expected = int(_prompt("Какая скорость для вас считается нормальной, Мбит/с", str(args.expected_mbps)))
-        validate_positive("Ожидаемая скорость", expected, 1, 100_000)
         iperf_streams = int(
             _prompt("Сколько параллельных TCP-потоков использовать", str(args.iperf_streams))
         )
@@ -5824,13 +5959,6 @@ def interactive_config(args: argparse.Namespace) -> AuditConfig | None:
                     raise ValueError("Для проверки burst-лимита нужен свой iperf3-сервер")
                 soak_iperf_host, soak_iperf_port = parse_host_port(endpoint)
                 if "iperf" not in tests:
-                    expected = int(
-                        _prompt(
-                            "Какая длительная скорость считается нормальной, Мбит/с",
-                            str(args.expected_mbps),
-                        )
-                    )
-                    validate_positive("Ожидаемая скорость", expected, 1, 100_000)
                     iperf_streams = int(
                         _prompt(
                             "Сколько параллельных TCP-потоков использовать",
@@ -5919,7 +6047,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Число параллельных TCP-потоков iperf3 (-P)",
     )
     parser.add_argument("--udp-mbps", type=int, default=50)
-    parser.add_argument("--expected-mbps", type=int, default=300)
+    parser.add_argument(
+        "--expected-mbps",
+        type=int,
+        default=0,
+        help=(
+            "Ручной ориентир скорости; 0 (по умолчанию) — автоматическая оценка "
+            "по фактическому каналу"
+        ),
+    )
     parser.add_argument("--ping-count", type=int, default=20)
     parser.add_argument(
         "--tcp-port",
@@ -5973,7 +6109,7 @@ def validate_cli_settings(args: argparse.Namespace) -> None:
     validate_positive("--iperf-seconds", args.iperf_seconds, 3, 120)
     validate_positive("--iperf-streams", args.iperf_streams, 1, 32)
     validate_positive("--udp-mbps", args.udp_mbps, 1, 100_000)
-    validate_positive("--expected-mbps", args.expected_mbps, 1, 100_000)
+    validate_positive("--expected-mbps", args.expected_mbps, 0, 100_000)
     validate_positive("--ping-count", args.ping_count, 3, 300)
     validate_positive("--tcp-port", args.tcp_port, 1, 65535)
     validate_positive("--soak-seconds", args.soak_seconds, 60, 3600)
