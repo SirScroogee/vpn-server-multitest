@@ -39,7 +39,7 @@ import urllib.request
 from typing import Any
 
 
-VERSION = "1.13.0"
+VERSION = "1.14.0"
 DEFAULT_TARGETS = ["1.1.1.1", "dns.google"]
 DEFAULT_REPORT_DIR = "server-audit-reports"
 RU_IPERF_CATALOG_URL = (
@@ -2655,6 +2655,67 @@ def _throughput_score(mbps: float, expected: float) -> float:
     return 100.0
 
 
+def _iperf_retransmission_status(retransmits_per_gib: float | None) -> str:
+    """Return a human status for a comparable, volume-normalized TCP metric.
+
+    iperf3 and the kernel do not define universal pass/fail limits.  These
+    deliberately broad operational bands flag paths that deserve a repeat
+    test without pretending that Retr is an exact packet-loss percentage.
+    """
+    if retransmits_per_gib is None:
+        return "ИЗМЕРЕНО"
+    if retransmits_per_gib <= 500:
+        return "ХОРОШО"
+    if retransmits_per_gib <= 5_000:
+        return "ВНИМАНИЕ"
+    return "ПЛОХО"
+
+
+def _iperf_retransmission_score(retransmits_per_gib: float) -> float:
+    return _piecewise_lower_better(
+        retransmits_per_gib,
+        [
+            (100, 100),
+            (500, 95),
+            (1_000, 85),
+            (5_000, 65),
+            (20_000, 35),
+            (100_000, 10),
+            (math.inf, 0),
+        ],
+    )
+
+
+def _representative_iperf_retransmits_per_gib(
+    measurements: list[dict[str, Any]],
+) -> float | None:
+    comparable = [
+        item
+        for item in measurements
+        if isinstance(item.get("retransmits_per_gib"), (int, float))
+    ]
+    if not comparable:
+        return None
+    public = [
+        item
+        for item in comparable
+        if isinstance(item.get("endpoint"), dict) and item["endpoint"].get("public")
+    ]
+    selected = public or comparable
+    direction_medians: list[float] = []
+    for direction in ("upload", "download"):
+        values = [
+            float(item["retransmits_per_gib"])
+            for item in selected
+            if item.get("direction") == direction
+        ]
+        if values:
+            direction_medians.append(statistics.median(values))
+    if direction_medians:
+        return max(direction_medians)
+    return statistics.median(float(item["retransmits_per_gib"]) for item in selected)
+
+
 def calculate_score(
     results: list[TestResult],
     role: str,
@@ -2725,7 +2786,13 @@ def calculate_score(
             )
         else:
             weakest_direction = min(float(item["mbps"]) for item in iperfs)
-        dimensions["throughput"] = round(_throughput_score(weakest_direction, expected_mbps), 1)
+        speed_score = _throughput_score(weakest_direction, expected_mbps)
+        representative_retransmits = _representative_iperf_retransmits_per_gib(iperfs)
+        if representative_retransmits is None:
+            dimensions["throughput"] = round(speed_score, 1)
+        else:
+            retransmission_score = _iperf_retransmission_score(representative_retransmits)
+            dimensions["throughput"] = round(speed_score * 0.7 + retransmission_score * 0.3, 1)
     system_parts: list[float] = []
     if vmstats:
         steal = max(float(item["steal_avg_percent"]) for item in vmstats)
@@ -2799,6 +2866,30 @@ def calculate_score(
             warnings.append(result.summary)
         if result.category == "tcp" and result.status == "failed":
             warnings.append(f"{result.name}: соединение не установлено; порт может быть закрыт или фильтроваться")
+        normalized_retransmits = result.metrics.get("retransmits_per_gib")
+        if result.category in {"iperf", "soak_iperf"} and isinstance(
+            normalized_retransmits, (int, float)
+        ):
+            retransmission_status = _iperf_retransmission_status(float(normalized_retransmits))
+            if retransmission_status in {"ВНИМАНИЕ", "ПЛОХО"}:
+                endpoint = result.metrics.get("endpoint")
+                endpoint_name = (
+                    ", ".join(
+                        str(value)
+                        for value in (endpoint.get("city"), endpoint.get("name"))
+                        if value
+                    )
+                    if isinstance(endpoint, dict)
+                    else result.name
+                )
+                warnings.append(
+                    f"{endpoint_name}: TCP-повторы {float(normalized_retransmits):g}/ГиБ — "
+                    + (
+                        "слишком много; возможны потери, перегрузка или нестабильный маршрут"
+                        if retransmission_status == "ПЛОХО"
+                        else "выше спокойного уровня; повторите измерение"
+                    )
+                )
     if not measured["iperf_bidirectional"] and (
         requested_tests is None or bool(requested_tests & {"iperf", "udp"})
     ):
@@ -3347,7 +3438,10 @@ def clear_console(*, enabled: bool = True) -> None:
             return
         except OSError:
             pass
-    sys.stdout.write("\033[2J\033[H")
+    # Clear the visible page first, then its saved scrollback.  This order also
+    # handles PuTTY's default "push erased text into scrollback" behaviour.
+    # PuTTY may deliberately ignore CSI 3 J if remote clearing is disabled.
+    sys.stdout.write("\033[2J\033[3J\033[H")
     sys.stdout.flush()
 
 
@@ -3867,6 +3961,102 @@ def _iperf_retransmit_text(metrics: dict[str, Any]) -> str:
     return f"{retransmits} ({_display_number(normalized, '/ГиБ')})"
 
 
+def _compact_count(value: Any) -> str:
+    if not isinstance(value, (int, float)):
+        return "—"
+    number = float(value)
+    absolute = abs(number)
+    if absolute >= 1_000_000:
+        return f"{number / 1_000_000:.1f}m"
+    if absolute >= 1_000:
+        return f"{number / 1_000:.1f}k"
+    return f"{number:g}"
+
+
+def _group_iperf_directions(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for result in results:
+        metrics = result.get("metrics", {})
+        endpoint = metrics.get("endpoint")
+        if isinstance(endpoint, dict):
+            key = (
+                endpoint.get("host"),
+                metrics.get("selected_port"),
+                endpoint.get("city"),
+                endpoint.get("name"),
+            )
+        else:
+            key = (_endpoint_name(result), metrics.get("selected_port"))
+        group = groups.setdefault(
+            key,
+            {"name": _endpoint_name(result), "upload": None, "download": None},
+        )
+        direction = metrics.get("direction")
+        if direction in {"upload", "download"}:
+            group[direction] = result
+    return list(groups.values())
+
+
+def _iperf_pair_streams(group: dict[str, Any]) -> str:
+    values = []
+    for direction in ("upload", "download"):
+        result = group.get(direction)
+        value = result.get("metrics", {}).get("streams") if result else None
+        values.append(value)
+    if values[0] is not None and values[0] == values[1]:
+        return str(values[0])
+    return f"U {values[0] if values[0] is not None else '—'} · D {values[1] if values[1] is not None else '—'}"
+
+
+def _iperf_pair_retransmits(group: dict[str, Any]) -> str:
+    values: list[str] = []
+    for direction in ("upload", "download"):
+        result = group.get(direction)
+        metrics = result.get("metrics", {}) if result else {}
+        normalized = metrics.get("retransmits_per_gib")
+        if isinstance(normalized, (int, float)):
+            values.append(_compact_count(normalized))
+        elif metrics.get("retransmits") == 0:
+            values.append("0")
+        else:
+            values.append("—")
+    return f"U {values[0]} · D {values[1]}"
+
+
+def _iperf_pair_cpu(group: dict[str, Any]) -> str:
+    values: list[str] = []
+    for direction in ("upload", "download"):
+        result = group.get(direction)
+        cpu = result.get("metrics", {}).get("local_cpu_percent") if result else None
+        values.append(_display_number(cpu, "%", 1))
+    return f"U {values[0]} · D {values[1]}"
+
+
+def _worst_iperf_status(statuses: list[str]) -> str:
+    rank = {"ХОРОШО": 0, "ИЗМЕРЕНО": 0, "НЕ ПРОВЕРЕНО": 1, "ВНИМАНИЕ": 1, "ПЛОХО": 2}
+    return max(statuses or ["НЕ ПРОВЕРЕНО"], key=lambda item: rank.get(item, 1))
+
+
+def _iperf_endpoint_status(
+    group: dict[str, Any],
+    expected_mbps: int | None,
+) -> str:
+    statuses: list[str] = []
+    for direction in ("upload", "download"):
+        result = group.get(direction)
+        metrics = result.get("metrics", {}) if result else {}
+        speed = metrics.get("mbps")
+        statuses.append(
+            _throughput_status(float(speed), expected_mbps)
+            if isinstance(speed, (int, float))
+            else "ВНИМАНИЕ"
+        )
+        normalized = metrics.get("retransmits_per_gib")
+        if isinstance(normalized, (int, float)):
+            statuses.append(_iperf_retransmission_status(float(normalized)))
+    return _worst_iperf_status(statuses)
+
+
 def _tabular_group(category: str) -> str | None:
     if category in {"ping", "tcp", "iperf", "udp", "disk"}:
         return category
@@ -4057,65 +4247,61 @@ def _tabular_result_section(
             )
             if missing_tool:
                 return _iperf_missing_lines(missing_tool)
+        grouped = _group_iperf_directions(results)
         rows = []
-        for result in results:
-            metrics = result.get("metrics", {})
-            speed = metrics.get("mbps")
-            direction = metrics.get("direction")
-            if speed is None:
-                status = _result_status(result)
-            else:
-                status = _throughput_status(float(speed), expected_mbps)
+        for endpoint in grouped:
+            upload = endpoint.get("upload")
+            download = endpoint.get("download")
+            upload_metrics = upload.get("metrics", {}) if upload else {}
+            download_metrics = download.get("metrics", {}) if download else {}
             rows.append(
                 [
-                    _endpoint_name(result),
-                    "ОТДАЧА" if direction == "upload" else "ЗАГРУЗКА" if direction == "download" else "—",
-                    metrics.get("streams", "—"),
-                    _display_number(speed, " Мбит/с"),
-                    _iperf_retransmit_text(metrics),
-                    _display_number(metrics.get("local_cpu_percent"), "%"),
-                    status,
+                    endpoint["name"],
+                    _iperf_pair_streams(endpoint),
+                    _display_number(upload_metrics.get("mbps"), " Мбит/с"),
+                    _display_number(download_metrics.get("mbps"), " Мбит/с"),
+                    _iperf_pair_retransmits(endpoint),
+                    _iperf_pair_cpu(endpoint),
+                    _iperf_endpoint_status(endpoint, expected_mbps),
                 ]
             )
         if total_width < 100:
-            compact_rows = [
-                [f"{row[0]} • {str(row[1]).lower()}", row[2], row[3], row[4], row[6]]
-                for row in rows
-            ]
+            point_width = max(17, total_width - 56)
+            compact_rows = [[row[0], row[1], row[2], row[3], row[4], row[6]] for row in rows]
             table = _semantic_table(
-                ["ТОЧКА", "ПОТОКИ", "СКОРОСТЬ", "TCP-ПОВТОРЫ", "СТАТУС"],
+                ["ТОЧКА", "ПОТОКИ", "UPLOAD", "DOWNLOAD", "RETR/ГиБ U/D", "СТАТУС"],
                 compact_rows,
-                [21, 7, 12, 14, 14],
+                [point_width, 5, 9, 9, 13, 10],
             )
-        elif total_width < 115:
-            medium_rows = [[*row[:5], row[6]] for row in rows]
-            point_width = min(35, max(17, total_width - 73))
+        elif total_width < 120:
+            point_width = max(17, total_width - 83)
             table = _semantic_table(
                 [
                     "ТОЧКА",
-                    "НАПРАВЛЕНИЕ",
                     "ПОТОКИ",
-                    "СКОРОСТЬ",
-                    "TCP-ПОВТОРЫ",
-                    "СТАТУС",
-                ],
-                medium_rows,
-                [point_width, 12, 7, 14, 16, 14],
-            )
-        else:
-            point_width = min(43, max(17, total_width - 85))
-            table = _semantic_table(
-                [
-                    "ТОЧКА",
-                    "НАПРАВЛЕНИЕ",
-                    "ПОТОКИ",
-                    "СКОРОСТЬ",
-                    "TCP-ПОВТОРЫ",
-                    "CPU",
+                    "UPLOAD",
+                    "DOWNLOAD",
+                    "TCP-ПОВТОРЫ/ГиБ",
+                    "CPU U/D",
                     "СТАТУС",
                 ],
                 rows,
-                [point_width, 12, 7, 14, 16, 10, 14],
+                [point_width, 7, 12, 12, 17, 11, 12],
+            )
+        else:
+            point_width = min(43, max(24, total_width - 90))
+            table = _semantic_table(
+                [
+                    "ТОЧКА",
+                    "ПОТОКИ",
+                    "UPLOAD",
+                    "DOWNLOAD",
+                    "TCP-ПОВТОРЫ/ГиБ",
+                    "CPU U/D",
+                    "СТАТУС",
+                ],
+                rows,
+                [point_width, 7, 13, 13, 18, 15, 12],
             )
         lines = ["◆ IPERF3 TCP ПО КАЖДОЙ ТОЧКЕ", *table]
         skipped = list(
@@ -4126,10 +4312,22 @@ def _tabular_result_section(
             )
         )
         details = [f"! {item}" for item in skipped]
-        if any(int(item.get("metrics", {}).get("retransmits", 0)) > 0 for item in results):
+        normalized_values = [
+            float(item["metrics"]["retransmits_per_gib"])
+            for item in results
+            if isinstance(item.get("metrics", {}).get("retransmits_per_gib"), (int, float))
+        ]
+        if normalized_values:
             details.append(
-                "· TCP-повторы означают повторную передачу сегментов. Сравнивайте показатель на ГиБ между серверами; несколько повторов сами по себе не доказывают плохой канал."
+                "· TCP-повторы показаны на 1 ГиБ: U — upload, D — download. Это повторно отправленные TCP-сегменты, а не точный процент потерь."
             )
+            details.append(
+                "· Эвристика: до 500/ГиБ — хорошо; 501–5000 — внимание; больше 5000 — плохо. Публичную точку с предупреждением перепроверьте позже."
+            )
+            if max(normalized_values) > 5_000:
+                details.append(
+                    "! Большое число повторов означает потери/перегрузку на пути или самой тестовой точки, даже если TCP сохранил высокую скорость повторной отправкой данных."
+                )
         if details:
             lines.extend(["", _divider(), "", *details])
         return lines
@@ -4815,8 +5013,26 @@ def _focused_verdict(test: str, results: list[dict[str, Any]], expected_mbps: in
             label, text = "ВНИМАНИЕ", f"слабейшее направление даёт {weakest:g} Мбит/с — немного ниже ориентира {expected_mbps}"
         else:
             label, text = "ПЛОХО", f"слабейшее направление даёт {weakest:g} Мбит/с при ориентире {expected_mbps}"
+        representative_retransmits = _representative_iperf_retransmits_per_gib(
+            [
+                item.get("metrics", {})
+                for item in results
+                if "mbps" in item.get("metrics", {})
+            ]
+        )
+        if representative_retransmits is not None:
+            retransmission_status = _iperf_retransmission_status(representative_retransmits)
+            text += f" • TCP-повторы: {representative_retransmits:g}/ГиБ"
+            if retransmission_status == "ПЛОХО":
+                label = "ПЛОХО"
+                text += " — слишком много"
+            elif retransmission_status == "ВНИМАНИЕ" and label == "ХОРОШО":
+                label = "ВНИМАНИЕ"
+                text += " — выше спокойного уровня"
         if not both:
-            return "ВНИМАНИЕ", text + "; измерено не оба направления"
+            if label == "ХОРОШО":
+                label = "ВНИМАНИЕ"
+            return label, text + "; измерено не оба направления"
         return label, text
     if test == "tcp" and measured:
         tcp_results = [item for item in measured if item.get("category") == "tcp"]
