@@ -39,7 +39,7 @@ import urllib.request
 from typing import Any
 
 
-VERSION = "1.17.0"
+VERSION = "1.17.1"
 DEFAULT_TARGETS = ["1.1.1.1", "dns.google"]
 DEFAULT_REPORT_DIR = "server-audit-reports"
 IPERF_TCP_STREAM_PROFILES = (1, 4)
@@ -4930,7 +4930,7 @@ def _tabular_result_section(
                 conntrack_value = (
                     f"{conntrack_count} / {conntrack_max}"
                     if conntrack_count is not None and conntrack_max is not None
-                    else "не определено"
+                    else f"не определено — {metrics.get('nf_conntrack_note') or 'счётчики ядра недоступны'}"
                 )
                 if isinstance(conntrack_utilization, (int, float)):
                     conntrack_value += f" ({float(conntrack_utilization):g}% заполнено)"
@@ -4996,14 +4996,6 @@ def _tabular_result_section(
                         ],
                     ]
                 )
-                if metrics.get("nf_conntrack_note"):
-                    rows.append(
-                        [
-                            "Conntrack пояснение",
-                            metrics["nf_conntrack_note"],
-                            "СПРАВОЧНО",
-                        ]
-                    )
             elif "steal_avg_percent" in metrics:
                 rows.append(
                     [
